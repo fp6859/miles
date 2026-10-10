@@ -27,7 +27,7 @@ SPORTS = {
     "Volleyball": 12,
 }
 
-# ── Core functions (same logic as before, cleaned up) ───────
+# ── Core functions ───────────────────────────────────────────
 SEP_FIELD = chr(0xAC)
 SEP_KV = chr(0xF7)
 
@@ -120,10 +120,12 @@ def fetch_odds(event_id: str, geo_code: str = "GB") -> list[dict]:
         for o in odds_items:
             try:
                 curr = float(o["value"])
-                open_ = float(o.get("opening") or curr)
+                open_raw = o.get("opening")
+                open_ = float(open_raw) if open_raw is not None else curr
                 outcomes.append({
                     "current": curr,
-                    "opening": open_
+                    "opening": open_,
+                    "opening_raw": open_raw,  # for debugging
                 })
             except (TypeError, ValueError, KeyError):
                 continue
@@ -137,20 +139,23 @@ def fetch_odds(event_id: str, geo_code: str = "GB") -> list[dict]:
     return results
 
 def percentage_shortening(opening: float, current: float) -> float:
-    if opening <= 0 or current >= opening:
+    if not opening or opening <= 0:
         return 0.0
-    return (opening - current) / opening * 100.0
+    if current >= opening:
+        return 0.0
+    return round((opening - current) / opening * 100.0, 1)
 
 # ── Sidebar controls ─────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
     sport_name = st.selectbox("Sport", list(SPORTS.keys()), index=0)
-    threshold = st.slider("Minimum shortening (%)", 5.0, 30.0, 10.0, 0.5)
+    threshold = st.slider("Minimum shortening (%)", 1.0, 30.0, 10.0, 0.5)
     day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
     day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
     geo_code = st.selectbox("Bookmaker region", ["GB", "US", "DE", "FR", "ES", "IT"], index=0)
-    max_matches = st.number_input("Max matches to scan", min_value=10, max_value=200, value=60, step=10)
-    delay = st.slider("Delay between requests (seconds)", 0.2, 1.5, 0.5, 0.1)
+    max_matches = st.number_input("Max matches to scan", min_value=10, max_value=200, value=50, step=10)
+    delay = st.slider("Delay between requests (seconds)", 0.2, 1.5, 0.4, 0.1)
+    show_debug = st.checkbox("Show debug info", value=True)
 
     run_button = st.button("🔍 Search for shortened odds", type="primary", use_container_width=True)
 
@@ -165,11 +170,15 @@ if run_button:
         st.warning("No matches found or the feed failed.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches. Scanning odds (this may take a minute)...")
+    st.info(f"Found {len(matches)} matches. Scanning odds...")
 
     progress = st.progress(0)
     status = st.empty()
     candidates = []
+    all_moves_summary = []
+    debug_samples = []
+    matches_with_odds = 0
+    matches_with_any_movement = 0
 
     matches_to_scan = matches[:max_matches]
 
@@ -181,28 +190,59 @@ if run_button:
         if not odds_list:
             continue
 
+        matches_with_odds += 1
+
         best_pct = 0.0
         best_detail = None
-        all_moves = []
+        match_moves = []
 
         for bk in odds_list:
             for oc in bk["outcomes"]:
-                pct = percentage_shortening(oc["opening"], oc["current"])
+                opening = oc["opening"]
+                current = oc["current"]
+                pct = percentage_shortening(opening, current)
+
                 if pct > 0:
-                    all_moves.append({
+                    matches_with_any_movement += 1
+                    move = {
                         "bookmaker": bk["bookmaker_name"],
-                        "opening": oc["opening"],
-                        "current": oc["current"],
-                        "pct": round(pct, 1),
+                        "opening": opening,
+                        "current": current,
+                        "pct": pct,
+                    }
+                    match_moves.append(move)
+                    all_moves_summary.append({
+                        "Match": f"{m['home']} vs {m['away']}",
+                        "Bookmaker": bk["bookmaker_name"],
+                        "Opening": opening,
+                        "Current": current,
+                        "Shortening %": pct,
                     })
+
                 if pct > best_pct:
                     best_pct = pct
                     best_detail = {
                         "bookmaker": bk["bookmaker_name"],
+                        "opening": opening,
+                        "current": current,
+                        "pct": pct,
+                    }
+
+        # Collect debug samples
+        if len(debug_samples) < 6 and odds_list:
+            sample_odds = []
+            for bk in odds_list[:3]:
+                for oc in bk["outcomes"]:
+                    sample_odds.append({
+                        "bookmaker": bk["bookmaker_name"],
+                        "opening_raw": oc.get("opening_raw"),
                         "opening": oc["opening"],
                         "current": oc["current"],
-                        "pct": round(pct, 1),
-                    }
+                    })
+            debug_samples.append({
+                "match": f"{m['home']} vs {m['away']}",
+                "odds": sample_odds[:6],  # limit size
+            })
 
         if best_pct >= threshold:
             start_dt = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
@@ -211,11 +251,10 @@ if run_button:
                 "Away": m["away"],
                 "Tournament": m["tourney"],
                 "Start (UTC)": start_dt.strftime("%Y-%m-%d %H:%M") if start_dt else "",
-                "Max Shortening %": round(best_pct, 1),
+                "Max Shortening %": best_pct,
                 "Best Move": f"{best_detail['bookmaker']} {best_detail['opening']} → {best_detail['current']}" if best_detail else "",
                 "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
-                "_moves": all_moves,
-                "_event_id": m["event_id"],
+                "_moves": match_moves,
             })
 
         if delay and i < len(matches_to_scan) - 1:
@@ -224,13 +263,29 @@ if run_button:
     progress.empty()
     status.empty()
 
-    # Sort results
+    # Summary stats
+    st.info(
+        f"Scanned **{len(matches_to_scan)}** matches → "
+        f"**{matches_with_odds}** had odds data → "
+        f"**{matches_with_any_movement}** had at least some shortening"
+    )
+
+    # Biggest moves (any size)
+    if all_moves_summary:
+        st.subheader("Biggest moves found (any size)")
+        moves_df = (
+            pd.DataFrame(all_moves_summary)
+            .sort_values("Shortening %", ascending=False)
+            .head(25)
+        )
+        st.dataframe(moves_df, hide_index=True, use_container_width=True)
+
+    # Results that meet the threshold
     candidates.sort(key=lambda x: (-x["Max Shortening %"], x["Start (UTC)"]))
 
     st.success(f"Found **{len(candidates)}** games with ≥ {threshold}% shortening")
 
     if candidates:
-        # Summary table
         df = pd.DataFrame([{k: v for k, v in c.items() if not k.startswith("_")} for c in candidates])
         st.dataframe(
             df,
@@ -240,10 +295,9 @@ if run_button:
             },
             hide_index=True,
             use_container_width=True,
-            height=400
+            height=350
         )
 
-        # Detailed expandable cards
         st.subheader("Detailed moves")
         for c in candidates:
             with st.expander(f"{c['Home']} vs {c['Away']} — {c['Max Shortening %']}% ({c['Tournament']})"):
@@ -252,10 +306,15 @@ if run_button:
                 if c["_moves"]:
                     moves_df = pd.DataFrame(c["_moves"]).sort_values("pct", ascending=False)
                     st.dataframe(moves_df, hide_index=True, use_container_width=True)
-                else:
-                    st.write("No individual move details.")
     else:
-        st.info("No games met the threshold. Try lowering the percentage or scanning more matches.")
+        st.info("No games met the threshold. Check the 'Biggest moves found' table above or lower the percentage.")
+
+    # Debug section
+    if show_debug and debug_samples:
+        with st.expander("Debug: sample opening vs current values from the API"):
+            for sample in debug_samples:
+                st.write(f"**{sample['match']}**")
+                st.json(sample["odds"])
 
 else:
     st.info("👈 Set your filters on the left and click **Search for shortened odds**.")
