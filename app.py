@@ -1,169 +1,151 @@
 import streamlit as st
 import requests
-import time
-import json
-import re
-from datetime import datetime, timezone
-from pathlib import Path
 import pandas as pd
+from datetime import datetime
 
-st.set_page_config(page_title="Odds Movement Tracker", page_icon="📉", layout="wide")
-st.title("📉 Odds Movement Tracker")
-st.caption("Uses the Flashscore feed (which works) and extracts any odds present.")
+st.set_page_config(page_title="Value Scanner", page_icon="💰", layout="wide")
+st.title("💰 Value Scanner")
+st.caption("Current market odds vs simple model baseline → sorted by highest value")
+
+# ── API key (sidebar or secrets) ─────────────────────────────
+API_KEY = st.secrets.get("ODDS_API_KEY", "")
+if not API_KEY:
+    API_KEY = st.sidebar.text_input("Odds API Key", type="password",
+                                    help="Free key from the-odds-api.com")
 
 SPORTS = {
-    "Football (Soccer)": 1,
-    "Tennis": 2,
-    "Basketball": 3,
-    "Ice Hockey": 4,
-    "American Football": 5,
-    "Baseball": 6,
-    "Handball": 7,
-    "Rugby Union": 8,
-    "Volleyball": 12,
+    "Football (EPL)": "soccer_epl",
+    "Football (La Liga)": "soccer_spain_la_liga",
+    "Football (Bundesliga)": "soccer_germany_bundesliga",
+    "Football (Serie A)": "soccer_italy_serie_a",
+    "American Football (NFL)": "americanfootball_nfl",
+    "Basketball (NBA)": "basketball_nba",
+    "Ice Hockey (NHL)": "icehockey_nhl",
+    "Baseball (MLB)": "baseball_mlb",
+    "Tennis (ATP)": "tennis_atp_wimbledon",  # adjust tournament as needed
 }
 
-SEP_FIELD = chr(0xAC)
-SEP_KV = chr(0xF7)
-CACHE_FILE = Path("odds_cache.json")
-
-FS_HEADERS = {
-    "x-fsign": "SW9D1eZo",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://www.flashscore.com/",
-    "Accept": "*/*",
-    "Origin": "https://www.flashscore.com",
-}
-
-def parse_fields(section: str) -> dict:
-    out = {}
-    for part in section.split(SEP_FIELD):
-        if SEP_KV in part:
-            k, _, v = part.partition(SEP_KV)
-            out[k] = v
-    return out
-
-def fetch_matches_with_odds(sport_id: int, day_offset: int = 0) -> list[dict]:
-    url = f"https://www.flashscore.com/x/feed/f_{sport_id}_{day_offset}_0_en-gb_1"
+def fetch_odds(sport_key: str, regions: str = "uk"):
+    if not API_KEY:
+        return []
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": API_KEY,
+        "regions": regions,
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+    }
     try:
-        resp = requests.get(url, headers=FS_HEADERS, timeout=15)
-        resp.raise_for_status()
-        raw = resp.text
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        remaining = r.headers.get("x-requests-remaining", "?")
+        st.sidebar.caption(f"Requests remaining: {remaining}")
+        return r.json()
     except Exception as e:
-        st.error(f"Feed failed: {e}")
+        st.error(f"API error: {e}")
         return []
 
-    matches = []
-    cur_tourney = ""
-    for section in raw.split("~"):
-        fields = parse_fields(section)
-        if "ZA" in fields:
-            cur_tourney = fields["ZA"]
-            continue
-        if "AA" not in fields or fields.get("AB") == "3":
-            continue
+def simple_model_prob(home: str, away: str) -> dict:
+    """
+    Very basic placeholder model.
+    Replace this with a real model (Elo, Poisson, ratings, etc.) later.
+    Currently returns a mild home advantage + slight randomness so it isn't flat.
+    """
+    # Mild home advantage baseline
+    base_home = 0.42
+    base_draw = 0.28
+    base_away = 0.30
+    # Tiny name-based tweak so different matches aren't identical
+    tweak = (hash(home + away) % 100) / 1000.0
+    home_p = min(0.75, max(0.15, base_home + tweak))
+    away_p = min(0.75, max(0.15, base_away - tweak))
+    draw_p = max(0.05, 1.0 - home_p - away_p)
+    total = home_p + draw_p + away_p
+    return {
+        "home": home_p / total,
+        "draw": draw_p / total,
+        "away": away_p / total,
+    }
 
-        # Try to pull any odds-like fields that sometimes appear in the feed
-        odds = {}
-        for k, v in fields.items():
-            if k.startswith("OD") or "odd" in k.lower():
-                try:
-                    odds[k] = float(v)
-                except ValueError:
-                    pass
-
-        matches.append({
-            "event_id": fields["AA"],
-            "home": fields.get("AE", ""),
-            "away": fields.get("AF", ""),
-            "tourney": cur_tourney,
-            "ts_start": int(fields.get("AD", 0) or 0),
-            "raw_odds": odds,
-            "fields_sample": {k: fields[k] for k in list(fields.keys())[:8]},  # debug
-        })
-    return matches
-
-def load_cache() -> dict:
-    if "odds_cache" not in st.session_state:
-        st.session_state.odds_cache = {}
-        if CACHE_FILE.exists():
-            try:
-                st.session_state.odds_cache = json.loads(CACHE_FILE.read_text())
-            except Exception:
-                pass
-    return st.session_state.odds_cache
-
-def save_cache(cache: dict):
-    st.session_state.odds_cache = cache
-    try:
-        CACHE_FILE.write_text(json.dumps(cache, indent=2))
-    except Exception:
-        pass
-
-def percentage_drop(old: float, new: float) -> float:
-    if not old or old <= 0 or new >= old:
-        return 0.0
-    return round((old - new) / old * 100.0, 1)
+def implied_prob(odds: float) -> float:
+    return 1.0 / odds if odds and odds > 1 else 0.0
 
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
-    sport_name = st.selectbox("Sport", list(SPORTS.keys()))
-    threshold = st.slider("Minimum shortening since last check (%)", 1.0, 20.0, 5.0, 0.5)
-    day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
-    day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
-    max_matches = st.number_input("Max matches", 10, 100, 40, 10)
-    clear_cache = st.button("Clear stored odds", use_container_width=True)
-    run_button = st.button("🔄 Check for movement", type="primary", use_container_width=True)
-
-if clear_cache:
-    st.session_state.odds_cache = {}
-    if CACHE_FILE.exists():
-        CACHE_FILE.unlink(missing_ok=True)
-    st.success("Cleared.")
+    if not API_KEY:
+        st.warning("Enter your free Odds API key")
+    sport_name = st.selectbox("Sport / League", list(SPORTS.keys()))
+    regions = st.selectbox("Region", ["uk", "eu", "us", "au"], index=0)
+    min_value = st.slider("Minimum value (%)", 0.0, 30.0, 5.0, 0.5)
+    run = st.button("🔍 Scan for value", type="primary", use_container_width=True)
 
 # ── Main ─────────────────────────────────────────────────────
-cache = load_cache()
+if run and API_KEY:
+    sport_key = SPORTS[sport_name]
+    with st.spinner("Fetching current odds..."):
+        events = fetch_odds(sport_key, regions)
 
-if run_button:
-    sport_id = SPORTS[sport_name]
-    with st.spinner("Fetching feed..."):
-        matches = fetch_matches_with_odds(sport_id, day_offset)
-
-    if not matches:
-        st.warning("No matches returned.")
+    if not events:
+        st.warning("No events returned.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches in the feed.")
-
-    # Debug: show a sample of what fields are present
-    with st.expander("Debug: sample feed fields from first few matches"):
-        for m in matches[:3]:
-            st.write(f"**{m['home']} vs {m['away']}**")
-            st.json(m["fields_sample"])
-            if m["raw_odds"]:
-                st.write("Odds-like fields:", m["raw_odds"])
-
-    # For now just display the matches we found
     rows = []
-    for m in matches[:max_matches]:
-        start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
-        rows.append({
-            "Home": m["home"],
-            "Away": m["away"],
-            "Tournament": m["tourney"],
-            "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
-            "Event ID": m["event_id"],
-            "Has odds fields": bool(m["raw_odds"]),
-        })
+    for ev in events:
+        home = ev.get("home_team", "")
+        away = ev.get("away_team", "")
+        commence = ev.get("commence_time", "")[:16].replace("T", " ")
 
-    st.subheader("Matches from feed")
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=400)
+        bookmakers = ev.get("bookmakers", [])
+        if not bookmakers:
+            continue
 
-    st.info("The feed works for matches. Odds are not currently appearing in the feed fields. We’ll need a different source for the actual 1X2 numbers.")
+        # Use the first bookmaker for simplicity (or you can average later)
+        bm = bookmakers[0]
+        market = next((m for m in bm.get("markets", []) if m["key"] == "h2h"), None)
+        if not market:
+            continue
+
+        outcomes = {o["name"]: o["price"] for o in market.get("outcomes", [])}
+        home_odds = outcomes.get(home)
+        away_odds = outcomes.get(away)
+        draw_odds = outcomes.get("Draw")
+
+        model = simple_model_prob(home, away)
+
+        for side, odds, model_p, label in [
+            ("home", home_odds, model["home"], home),
+            ("draw", draw_odds, model["draw"], "Draw"),
+            ("away", away_odds, model["away"], away),
+        ]:
+            if not odds or odds <= 1:
+                continue
+            market_p = implied_prob(odds)
+            edge = (model_p - market_p) / market_p * 100 if market_p else 0
+            if edge >= min_value:
+                rows.append({
+                    "Match": f"{home} vs {away}",
+                    "Start": commence,
+                    "Selection": label,
+                    "Market Odds": round(odds, 2),
+                    "Market Prob": f"{market_p*100:.1f}%",
+                    "Model Prob": f"{model_p*100:.1f}%",
+                    "Value %": round(edge, 1),
+                    "Bookmaker": bm.get("title", ""),
+                })
+
+    if rows:
+        df = pd.DataFrame(rows).sort_values("Value %", ascending=False)
+        st.success(f"Found {len(df)} value selections ≥ {min_value}%")
+        st.dataframe(df, hide_index=True, use_container_width=True, height=500)
+    else:
+        st.info("No selections above the value threshold with the current model.")
 
 else:
-    st.info("Click the button to load matches from the feed.")
+    st.info("Enter your API key and click **Scan for value**.")
 
 st.markdown("---")
-st.caption("This version confirms the feed works. Next step is a reliable odds source.")
+st.caption("""
+**Model note:** The baseline model is a simple placeholder (mild home advantage).  
+Replace the `simple_model_prob()` function with a real model (Elo, Poisson, ratings, etc.) for meaningful value.
+""")
