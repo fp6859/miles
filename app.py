@@ -68,34 +68,43 @@ def fetch_matches(sport_id: int, day_offset: int = 0) -> list[dict]:
     return matches
 
 def fetch_odds(event_id: str, geo_code: str = "GB") -> tuple[list[dict], str]:
-    """Returns (odds_list, error_message)"""
-    params = {
-        "_hash": "oce",
-        "eventId": event_id,
-        "projectId": "2",
-        "geoIpCode": geo_code,
-    }
-    try:
-        resp = requests.get(
-            "https://global.ds.lsapp.eu/odds/pq_graphql",
-            params=params,
-            headers=FS_HEADERS,
-            timeout=12
-        )
-        if resp.status_code != 200:
-            # Capture the actual error message from the server
-            body_preview = resp.text[:300].replace("\n", " ")
-            return [], f"HTTP {resp.status_code}: {body_preview}"
-        
-        data = resp.json()
-        event_odds = data.get("data", {}).get("findOddsByEventId") or {}
-        if not event_odds:
-            return [], "Empty findOddsByEventId"
-    except Exception as e:
-        return [], str(e)
+    headers = FS_HEADERS.copy()
+    headers.update({
+        "Accept-Language": "en-GB,en;q=0.9",
+        "x-geoip": "1",
+    })
 
-    # ... rest of the function stays the same (bookmaker mapping + outcomes parsing) ...
+    # Try a few known / common hashes
+    hashes_to_try = ["oce", "oce2", "odds", "fsodds", "pqo"]
 
+    for h in hashes_to_try:
+        params = {
+            "_hash": h,
+            "eventId": event_id,
+            "projectId": "2",
+            "geoIpCode": geo_code,
+        }
+        try:
+            resp = requests.get(
+                "https://global.ds.lsapp.eu/odds/pq_graphql",
+                params=params,
+                headers=headers,
+                timeout=12
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                event_odds = data.get("data", {}).get("findOddsByEventId") or {}
+                if event_odds:
+                    # success — continue with normal parsing below
+                    break
+            # else keep trying next hash
+        except Exception:
+            continue
+    else:
+        # All hashes failed
+        return [], "All hash attempts failed (HTTP 400 or empty)"
+
+    # ── normal parsing continues here (copy from previous version) ──
     bk_map = {}
     for bk in event_odds.get("settings", {}).get("bookmakers", []):
         inner = bk.get("bookmaker", {})
@@ -126,7 +135,6 @@ def fetch_odds(event_id: str, geo_code: str = "GB") -> tuple[list[dict], str]:
                 "outcomes": outcomes,
             })
     return results, ""
-
 def percentage_shortening(opening: float, current: float) -> float:
     if not opening or opening <= 0 or current >= opening:
         return 0.0
