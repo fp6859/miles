@@ -8,9 +8,8 @@ import pandas as pd
 
 st.set_page_config(page_title="Odds Movement Tracker", page_icon="📉", layout="wide")
 st.title("📉 Odds Movement Tracker")
-st.caption("Tracks shortening since the last check (not from opening). First run just saves current odds.")
+st.caption("Shows current odds + opening (when available) and tracks shortening since your last check.")
 
-# ── Sport mapping ────────────────────────────────────────────
 SPORTS = {
     "Football (Soccer)": 1,
     "Tennis": 2,
@@ -72,8 +71,8 @@ def fetch_matches(sport_id: int, day_offset: int = 0) -> list[dict]:
         })
     return matches
 
-def fetch_current_odds(event_id: str, geo_code: str = "GB") -> dict:
-    """Returns a simple dict of best/current main-market odds or empty."""
+def fetch_odds_detail(event_id: str, geo_code: str = "GB") -> dict:
+    """Returns current + opening for the main market, or empty dict."""
     params = {
         "_hash": "oce",
         "eventId": event_id,
@@ -96,7 +95,6 @@ def fetch_current_odds(event_id: str, geo_code: str = "GB") -> dict:
     except Exception:
         return {}
 
-    # Take the first usable bookmaker’s main market
     for item in event_odds.get("odds", []):
         if item.get("bettingScope") != "FULL_TIME":
             continue
@@ -106,12 +104,17 @@ def fetch_current_odds(event_id: str, geo_code: str = "GB") -> dict:
         if not odds_items:
             continue
         try:
-            return {
-                "home": float(odds_items[0]["value"]),
-                "draw": float(odds_items[1]["value"]) if len(odds_items) > 2 else None,
-                "away": float(odds_items[-1]["value"]),
-                "bookmaker": item.get("bookmakerId", "unknown"),
+            result = {
+                "home_current": float(odds_items[0]["value"]),
+                "home_opening": float(odds_items[0].get("opening") or odds_items[0]["value"]),
+                "away_current": float(odds_items[-1]["value"]),
+                "away_opening": float(odds_items[-1].get("opening") or odds_items[-1]["value"]),
+                "bookmaker": str(item.get("bookmakerId", "unknown")),
             }
+            if len(odds_items) > 2:
+                result["draw_current"] = float(odds_items[1]["value"])
+                result["draw_opening"] = float(odds_items[1].get("opening") or odds_items[1]["value"])
+            return result
         except (TypeError, ValueError, KeyError, IndexError):
             continue
     return {}
@@ -131,7 +134,7 @@ def save_cache(cache: dict):
     try:
         CACHE_FILE.write_text(json.dumps(cache, indent=2))
     except Exception:
-        pass  # Cloud may not allow writing; session state still works
+        pass
 
 def percentage_drop(old: float, new: float) -> float:
     if not old or old <= 0 or new >= old:
@@ -169,14 +172,14 @@ if run_button:
         st.warning("No matches found.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches. Checking current odds...")
+    st.info(f"Found {len(matches)} matches. Checking odds...")
 
     progress = st.progress(0)
     status = st.empty()
     movements = []
+    all_odds_rows = []
     new_cache = {}
-    scanned = 0
-    had_odds = 0
+    scanned_with_odds = 0
 
     to_scan = matches[:max_matches]
 
@@ -184,75 +187,97 @@ if run_button:
         status.text(f"{i+1}/{len(to_scan)}: {m['home']} vs {m['away']}")
         progress.progress((i + 1) / len(to_scan))
 
-        current = fetch_current_odds(m["event_id"], geo_code)
-        if not current:
+        odds = fetch_odds_detail(m["event_id"], geo_code)
+        if not odds:
             continue
 
-        had_odds += 1
+        scanned_with_odds += 1
         key = m["event_id"]
+
+        # Save current for next comparison
         new_cache[key] = {
-            "home": current["home"],
-            "draw": current.get("draw"),
-            "away": current["away"],
+            "home": odds["home_current"],
+            "draw": odds.get("draw_current"),
+            "away": odds["away_current"],
             "updated": datetime.now(timezone.utc).isoformat(),
             "match": f"{m['home']} vs {m['away']}",
         }
 
+        # Build display row
+        start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
+        row = {
+            "Home": m["home"],
+            "Away": m["away"],
+            "Tournament": m["tourney"],
+            "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
+            "Home Current": odds["home_current"],
+            "Home Opening": odds.get("home_opening"),
+            "Draw Current": odds.get("draw_current"),
+            "Draw Opening": odds.get("draw_opening"),
+            "Away Current": odds["away_current"],
+            "Away Opening": odds.get("away_opening"),
+            "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
+        }
+        all_odds_rows.append(row)
+
+        # Check movement vs last snapshot
         previous = cache.get(key)
         if previous:
             drops = []
-            for side in ["home", "draw", "away"]:
+            for side, curr_key in [("home", "home_current"), ("draw", "draw_current"), ("away", "away_current")]:
                 old = previous.get(side)
-                new = current.get(side)
+                new = odds.get(curr_key)
                 if old and new:
                     pct = percentage_drop(old, new)
                     if pct >= threshold:
                         drops.append(f"{side.title()} {old} → {new} ({pct}%)")
-
             if drops:
-                start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
-                movements.append({
-                    "Home": m["home"],
-                    "Away": m["away"],
-                    "Tournament": m["tourney"],
-                    "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
-                    "Movements": " | ".join(drops),
-                    "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
-                })
+                row["Movement"] = " | ".join(drops)
+                movements.append(row)
 
-        scanned += 1
         time.sleep(delay)
 
     progress.empty()
     status.empty()
 
-    # Save the new snapshot
-    # Keep previous entries for matches we didn’t re-scan this time
     cache.update(new_cache)
     save_cache(cache)
 
-    st.info(f"Scanned {scanned} matches with odds data.")
+    st.info(f"Scanned {scanned_with_odds} matches that returned odds data.")
 
+    # Always show current odds table
+    if all_odds_rows:
+        st.subheader("Current & Opening Odds")
+        df_all = pd.DataFrame(all_odds_rows)
+        st.dataframe(
+            df_all,
+            column_config={"Link": st.column_config.LinkColumn()},
+            hide_index=True,
+            use_container_width=True,
+            height=400,
+        )
+
+    # Movement section
     if movements:
         st.success(f"**{len(movements)}** games shortened ≥ {threshold}% since last check")
-        df = pd.DataFrame(movements)
+        df_move = pd.DataFrame(movements)
         st.dataframe(
-            df,
+            df_move,
             column_config={"Link": st.column_config.LinkColumn()},
             hide_index=True,
             use_container_width=True,
         )
     else:
         if any(cache):
-            st.info("No significant shortening since the last check. Run again later.")
+            st.info("No significant shortening since the last check.")
         else:
-            st.success("First run complete — current odds have been saved. Run again later to detect movement.")
+            st.success("First snapshot saved. Run again later to detect movement.")
 
 else:
     if cache:
-        st.info(f"Stored odds for **{len(cache)}** matches. Click **Check for movement** to compare against current prices.")
+        st.info(f"Stored snapshot for **{len(cache)}** matches. Click **Check for movement** to refresh and compare.")
     else:
-        st.info("No stored odds yet. Click **Check for movement** to take the first snapshot.")
+        st.info("No snapshot yet. Click **Check for movement** to capture current odds.")
 
 st.markdown("---")
-st.caption("First run saves current odds. Later runs compare against that snapshot and show shortenings. Cache lives in the browser session (and a local file when possible).")
+st.caption("Opening odds appear when the API returns them. Movement is calculated from the previous snapshot of current odds.")
