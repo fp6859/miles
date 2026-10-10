@@ -5,33 +5,83 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from bs4 import BeautifulSoup
 import pandas as pd
 
 st.set_page_config(page_title="Odds Movement Tracker", page_icon="📉", layout="wide")
 st.title("📉 Odds Movement Tracker")
-st.caption("Pulls the 1X2 odds shown on the Flashscore homepage list and tracks shortening since last check.")
+st.caption("Uses the Flashscore feed (which works) and extracts any odds present.")
 
-SPORT_PAGES = {
-    "Football (Soccer)": "https://www.flashscore.com/football/",
-    "Tennis": "https://www.flashscore.com/tennis/",
-    "Basketball": "https://www.flashscore.com/basketball/",
-    "Ice Hockey": "https://www.flashscore.com/hockey/",
-    "American Football": "https://www.flashscore.com/american-football/",
-    "Baseball": "https://www.flashscore.com/baseball/",
-    "Handball": "https://www.flashscore.com/handball/",
-    "Rugby Union": "https://www.flashscore.com/rugby-union/",
-    "Volleyball": "https://www.flashscore.com/volleyball/",
+SPORTS = {
+    "Football (Soccer)": 1,
+    "Tennis": 2,
+    "Basketball": 3,
+    "Ice Hockey": 4,
+    "American Football": 5,
+    "Baseball": 6,
+    "Handball": 7,
+    "Rugby Union": 8,
+    "Volleyball": 12,
 }
 
+SEP_FIELD = chr(0xAC)
+SEP_KV = chr(0xF7)
 CACHE_FILE = Path("odds_cache.json")
 
-HEADERS = {
+FS_HEADERS = {
+    "x-fsign": "SW9D1eZo",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
     "Referer": "https://www.flashscore.com/",
+    "Accept": "*/*",
+    "Origin": "https://www.flashscore.com",
 }
+
+def parse_fields(section: str) -> dict:
+    out = {}
+    for part in section.split(SEP_FIELD):
+        if SEP_KV in part:
+            k, _, v = part.partition(SEP_KV)
+            out[k] = v
+    return out
+
+def fetch_matches_with_odds(sport_id: int, day_offset: int = 0) -> list[dict]:
+    url = f"https://www.flashscore.com/x/feed/f_{sport_id}_{day_offset}_0_en-gb_1"
+    try:
+        resp = requests.get(url, headers=FS_HEADERS, timeout=15)
+        resp.raise_for_status()
+        raw = resp.text
+    except Exception as e:
+        st.error(f"Feed failed: {e}")
+        return []
+
+    matches = []
+    cur_tourney = ""
+    for section in raw.split("~"):
+        fields = parse_fields(section)
+        if "ZA" in fields:
+            cur_tourney = fields["ZA"]
+            continue
+        if "AA" not in fields or fields.get("AB") == "3":
+            continue
+
+        # Try to pull any odds-like fields that sometimes appear in the feed
+        odds = {}
+        for k, v in fields.items():
+            if k.startswith("OD") or "odd" in k.lower():
+                try:
+                    odds[k] = float(v)
+                except ValueError:
+                    pass
+
+        matches.append({
+            "event_id": fields["AA"],
+            "home": fields.get("AE", ""),
+            "away": fields.get("AF", ""),
+            "tourney": cur_tourney,
+            "ts_start": int(fields.get("AD", 0) or 0),
+            "raw_odds": odds,
+            "fields_sample": {k: fields[k] for k in list(fields.keys())[:8]},  # debug
+        })
+    return matches
 
 def load_cache() -> dict:
     if "odds_cache" not in st.session_state:
@@ -55,167 +105,65 @@ def percentage_drop(old: float, new: float) -> float:
         return 0.0
     return round((old - new) / old * 100.0, 1)
 
-def scrape_homepage_odds(sport_url: str) -> list[dict]:
-    """Scrape the main sport page for the visible 1X2 odds shown in the list."""
-    try:
-        resp = requests.get(sport_url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        st.error(f"Failed to load page: {e}")
-        return []
-
-    matches = []
-    # Flashscore match rows typically contain team names and odds cells
-    for row in soup.select("div.event__match, div[class*='event__match']"):
-        try:
-            home = row.select_one(".event__participant--home, [class*='participant--home']")
-            away = row.select_one(".event__participant--away, [class*='participant--away']")
-            if not home or not away:
-                continue
-            home_name = home.get_text(strip=True)
-            away_name = away.get_text(strip=True)
-
-            # Odds are usually in cells with class containing "odds"
-            odds_cells = row.select("[class*='odds'], .oddsCell, [data-odd]")
-            odds_values = []
-            for cell in odds_cells:
-                text = cell.get_text(strip=True)
-                # Extract decimal numbers
-                found = re.findall(r"\d+\.\d+", text)
-                for f in found:
-                    try:
-                        val = float(f)
-                        if 1.01 <= val <= 50:
-                            odds_values.append(val)
-                    except ValueError:
-                        pass
-
-            # Also check data attributes
-            for el in row.select("[data-odd], [data-odds]"):
-                val = el.get("data-odd") or el.get("data-odds")
-                if val:
-                    try:
-                        v = float(val)
-                        if 1.01 <= v <= 50:
-                            odds_values.append(v)
-                    except ValueError:
-                        pass
-
-            if len(odds_values) >= 2:
-                # Deduplicate while keeping order
-                seen = set()
-                unique = []
-                for v in odds_values:
-                    if v not in seen:
-                        seen.add(v)
-                        unique.append(v)
-
-                match = {
-                    "home": home_name,
-                    "away": away_name,
-                    "home_odds": unique[0] if len(unique) > 0 else None,
-                    "draw_odds": unique[1] if len(unique) > 2 else None,
-                    "away_odds": unique[-1] if len(unique) > 1 else None,
-                    "event_id": row.get("id", "") or f"{home_name}-{away_name}",
-                }
-                # Clean event id
-                if match["event_id"].startswith("g_1_"):
-                    match["event_id"] = match["event_id"].replace("g_1_", "")
-                matches.append(match)
-        except Exception:
-            continue
-
-    return matches
-
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
-    sport_name = st.selectbox("Sport", list(SPORT_PAGES.keys()))
+    sport_name = st.selectbox("Sport", list(SPORTS.keys()))
     threshold = st.slider("Minimum shortening since last check (%)", 1.0, 20.0, 5.0, 0.5)
-    delay = st.slider("Delay (seconds)", 0.5, 3.0, 1.5, 0.1)
+    day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
+    day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
+    max_matches = st.number_input("Max matches", 10, 100, 40, 10)
     clear_cache = st.button("Clear stored odds", use_container_width=True)
-    run_button = st.button("🔄 Check homepage odds", type="primary", use_container_width=True)
+    run_button = st.button("🔄 Check for movement", type="primary", use_container_width=True)
 
 if clear_cache:
     st.session_state.odds_cache = {}
     if CACHE_FILE.exists():
         CACHE_FILE.unlink(missing_ok=True)
-    st.success("Stored odds cleared.")
+    st.success("Cleared.")
 
 # ── Main ─────────────────────────────────────────────────────
 cache = load_cache()
 
 if run_button:
-    url = SPORT_PAGES[sport_name]
-    with st.spinner(f"Loading {sport_name} homepage..."):
-        matches = scrape_homepage_odds(url)
+    sport_id = SPORTS[sport_name]
+    with st.spinner("Fetching feed..."):
+        matches = fetch_matches_with_odds(sport_id, day_offset)
 
     if not matches:
-        st.warning("No matches with odds found on the page. The page structure may have changed.")
+        st.warning("No matches returned.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches with visible odds.")
+    st.info(f"Found {len(matches)} matches in the feed.")
 
-    movements = []
-    all_rows = []
-    new_cache = {}
+    # Debug: show a sample of what fields are present
+    with st.expander("Debug: sample feed fields from first few matches"):
+        for m in matches[:3]:
+            st.write(f"**{m['home']} vs {m['away']}**")
+            st.json(m["fields_sample"])
+            if m["raw_odds"]:
+                st.write("Odds-like fields:", m["raw_odds"])
 
-    for m in matches:
-        key = m["event_id"] or f"{m['home']}|{m['away']}"
-        new_cache[key] = {
-            "home": m["home_odds"],
-            "draw": m["draw_odds"],
-            "away": m["away_odds"],
-            "updated": datetime.now(timezone.utc).isoformat(),
-            "match": f"{m['home']} vs {m['away']}",
-        }
-
-        row = {
+    # For now just display the matches we found
+    rows = []
+    for m in matches[:max_matches]:
+        start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
+        rows.append({
             "Home": m["home"],
             "Away": m["away"],
-            "Home Odds": m["home_odds"],
-            "Draw Odds": m["draw_odds"],
-            "Away Odds": m["away_odds"],
-        }
-        all_rows.append(row)
+            "Tournament": m["tourney"],
+            "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
+            "Event ID": m["event_id"],
+            "Has odds fields": bool(m["raw_odds"]),
+        })
 
-        previous = cache.get(key)
-        if previous:
-            drops = []
-            for side, curr in [("home", m["home_odds"]), ("draw", m["draw_odds"]), ("away", m["away_odds"])]:
-                old = previous.get(side)
-                if old and curr:
-                    pct = percentage_drop(old, curr)
-                    if pct >= threshold:
-                        drops.append(f"{side.title()} {old} → {curr} ({pct}%)")
-            if drops:
-                row["Movement"] = " | ".join(drops)
-                movements.append(row)
+    st.subheader("Matches from feed")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, height=400)
 
-        time.sleep(delay)
-
-    cache.update(new_cache)
-    save_cache(cache)
-
-    st.subheader("Current Homepage Odds")
-    if all_rows:
-        st.dataframe(pd.DataFrame(all_rows), hide_index=True, use_container_width=True, height=450)
-
-    if movements:
-        st.success(f"**{len(movements)}** games shortened ≥ {threshold}% since last check")
-        st.dataframe(pd.DataFrame(movements), hide_index=True, use_container_width=True)
-    else:
-        if any(cache):
-            st.info("No significant shortening since the last check.")
-        else:
-            st.success("First snapshot saved from homepage odds. Run again later to detect movement.")
+    st.info("The feed works for matches. Odds are not currently appearing in the feed fields. We’ll need a different source for the actual 1X2 numbers.")
 
 else:
-    if cache:
-        st.info(f"Stored snapshot for **{len(cache)}** matches. Click the button to refresh from the homepage.")
-    else:
-        st.info("No snapshot yet. Click **Check homepage odds** to capture the current list.")
+    st.info("Click the button to load matches from the feed.")
 
 st.markdown("---")
-st.caption("Odds are scraped from the main sport page (the same view you showed). Movement is calculated against the previous snapshot of those odds.")
+st.caption("This version confirms the feed works. Next step is a reliable odds source.")
