@@ -2,13 +2,14 @@ import streamlit as st
 import requests
 import time
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
 st.set_page_config(page_title="Odds Movement Tracker", page_icon="📉", layout="wide")
 st.title("📉 Odds Movement Tracker")
-st.caption("Shows current odds + opening (when available) and tracks shortening since your last check.")
+st.caption("GraphQL first, HTML scrape fallback. Shows current odds and tracks shortening since last check.")
 
 SPORTS = {
     "Football (Soccer)": 1,
@@ -71,8 +72,7 @@ def fetch_matches(sport_id: int, day_offset: int = 0) -> list[dict]:
         })
     return matches
 
-def fetch_odds_detail(event_id: str, geo_code: str = "GB") -> dict:
-    """Returns current + opening for the main market, or empty dict."""
+def fetch_odds_graphql(event_id: str, geo_code: str = "GB") -> dict:
     params = {
         "_hash": "oce",
         "eventId": event_id,
@@ -84,7 +84,7 @@ def fetch_odds_detail(event_id: str, geo_code: str = "GB") -> dict:
             "https://global.ds.lsapp.eu/odds/pq_graphql",
             params=params,
             headers=FS_HEADERS,
-            timeout=12
+            timeout=10
         )
         if resp.status_code != 200:
             return {}
@@ -92,32 +92,77 @@ def fetch_odds_detail(event_id: str, geo_code: str = "GB") -> dict:
         event_odds = data.get("data", {}).get("findOddsByEventId") or {}
         if not event_odds:
             return {}
+        for item in event_odds.get("odds", []):
+            if item.get("bettingScope") != "FULL_TIME":
+                continue
+            if item.get("bettingType") not in ("HOME_DRAW_AWAY", "HOME_AWAY"):
+                continue
+            odds_items = item.get("odds", [])
+            if not odds_items:
+                continue
+            try:
+                result = {
+                    "home_current": float(odds_items[0]["value"]),
+                    "home_opening": float(odds_items[0].get("opening") or odds_items[0]["value"]),
+                    "away_current": float(odds_items[-1]["value"]),
+                    "away_opening": float(odds_items[-1].get("opening") or odds_items[-1]["value"]),
+                    "source": "graphql",
+                }
+                if len(odds_items) > 2:
+                    result["draw_current"] = float(odds_items[1]["value"])
+                    result["draw_opening"] = float(odds_items[1].get("opening") or odds_items[1]["value"])
+                return result
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
     except Exception:
-        return {}
-
-    for item in event_odds.get("odds", []):
-        if item.get("bettingScope") != "FULL_TIME":
-            continue
-        if item.get("bettingType") not in ("HOME_DRAW_AWAY", "HOME_AWAY"):
-            continue
-        odds_items = item.get("odds", [])
-        if not odds_items:
-            continue
-        try:
-            result = {
-                "home_current": float(odds_items[0]["value"]),
-                "home_opening": float(odds_items[0].get("opening") or odds_items[0]["value"]),
-                "away_current": float(odds_items[-1]["value"]),
-                "away_opening": float(odds_items[-1].get("opening") or odds_items[-1]["value"]),
-                "bookmaker": str(item.get("bookmakerId", "unknown")),
-            }
-            if len(odds_items) > 2:
-                result["draw_current"] = float(odds_items[1]["value"])
-                result["draw_opening"] = float(odds_items[1].get("opening") or odds_items[1]["value"])
-            return result
-        except (TypeError, ValueError, KeyError, IndexError):
-            continue
+        pass
     return {}
+
+def fetch_odds_html_fallback(event_id: str) -> dict:
+    """Simple HTML scrape fallback – extracts the first few decimal odds it finds."""
+    url = f"https://www.flashscore.com/match/{event_id}/"
+    try:
+        resp = requests.get(url, headers=FS_HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return {}
+        html = resp.text
+        # Look for sequences of decimal odds (common on the page)
+        odds_matches = re.findall(r'\b([1-9]\d?\.\d{2})\b', html)
+        odds = []
+        for o in odds_matches:
+            try:
+                val = float(o)
+                if 1.01 <= val <= 50.0:  # reasonable decimal odds range
+                    odds.append(val)
+            except ValueError:
+                continue
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for o in odds:
+            if o not in seen:
+                seen.add(o)
+                unique.append(o)
+            if len(unique) >= 6:
+                break
+        if len(unique) >= 2:
+            result = {
+                "home_current": unique[0],
+                "away_current": unique[1] if len(unique) > 1 else unique[0],
+                "source": "html",
+            }
+            if len(unique) >= 3:
+                result["draw_current"] = unique[2]
+            return result
+    except Exception:
+        pass
+    return {}
+
+def fetch_odds(event_id: str, geo_code: str = "GB") -> dict:
+    odds = fetch_odds_graphql(event_id, geo_code)
+    if odds:
+        return odds
+    return fetch_odds_html_fallback(event_id)
 
 def load_cache() -> dict:
     if "odds_cache" not in st.session_state:
@@ -149,8 +194,8 @@ with st.sidebar:
     day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
     day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
     geo_code = st.selectbox("Bookmaker region", ["GB", "US", "DE", "FR", "ES", "IT"])
-    max_matches = st.number_input("Max matches to scan", 10, 80, 30, 5)
-    delay = st.slider("Delay between requests (s)", 0.4, 2.0, 0.7, 0.1)
+    max_matches = st.number_input("Max matches to scan", 5, 40, 15, 5)
+    delay = st.slider("Delay between requests (s)", 0.5, 2.5, 1.0, 0.1)
     clear_cache = st.button("Clear stored odds", use_container_width=True)
     run_button = st.button("🔄 Check for movement", type="primary", use_container_width=True)
 
@@ -172,7 +217,7 @@ if run_button:
         st.warning("No matches found.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches. Checking odds...")
+    st.info(f"Found {len(matches)} matches. Checking odds (GraphQL + HTML fallback)...")
 
     progress = st.progress(0)
     status = st.empty()
@@ -187,40 +232,38 @@ if run_button:
         status.text(f"{i+1}/{len(to_scan)}: {m['home']} vs {m['away']}")
         progress.progress((i + 1) / len(to_scan))
 
-        odds = fetch_odds_detail(m["event_id"], geo_code)
+        odds = fetch_odds(m["event_id"], geo_code)
         if not odds:
             continue
 
         scanned_with_odds += 1
         key = m["event_id"]
 
-        # Save current for next comparison
         new_cache[key] = {
-            "home": odds["home_current"],
+            "home": odds.get("home_current"),
             "draw": odds.get("draw_current"),
-            "away": odds["away_current"],
+            "away": odds.get("away_current"),
             "updated": datetime.now(timezone.utc).isoformat(),
             "match": f"{m['home']} vs {m['away']}",
         }
 
-        # Build display row
         start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
         row = {
             "Home": m["home"],
             "Away": m["away"],
             "Tournament": m["tourney"],
             "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
-            "Home Current": odds["home_current"],
+            "Home Current": odds.get("home_current"),
             "Home Opening": odds.get("home_opening"),
             "Draw Current": odds.get("draw_current"),
             "Draw Opening": odds.get("draw_opening"),
-            "Away Current": odds["away_current"],
+            "Away Current": odds.get("away_current"),
             "Away Opening": odds.get("away_opening"),
+            "Source": odds.get("source", "unknown"),
             "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
         }
         all_odds_rows.append(row)
 
-        # Check movement vs last snapshot
         previous = cache.get(key)
         if previous:
             drops = []
@@ -245,7 +288,6 @@ if run_button:
 
     st.info(f"Scanned {scanned_with_odds} matches that returned odds data.")
 
-    # Always show current odds table
     if all_odds_rows:
         st.subheader("Current & Opening Odds")
         df_all = pd.DataFrame(all_odds_rows)
@@ -257,16 +299,9 @@ if run_button:
             height=400,
         )
 
-    # Movement section
     if movements:
         st.success(f"**{len(movements)}** games shortened ≥ {threshold}% since last check")
-        df_move = pd.DataFrame(movements)
-        st.dataframe(
-            df_move,
-            column_config={"Link": st.column_config.LinkColumn()},
-            hide_index=True,
-            use_container_width=True,
-        )
+        st.dataframe(pd.DataFrame(movements), column_config={"Link": st.column_config.LinkColumn()}, hide_index=True, use_container_width=True)
     else:
         if any(cache):
             st.info("No significant shortening since the last check.")
@@ -275,9 +310,9 @@ if run_button:
 
 else:
     if cache:
-        st.info(f"Stored snapshot for **{len(cache)}** matches. Click **Check for movement** to refresh and compare.")
+        st.info(f"Stored snapshot for **{len(cache)}** matches. Click **Check for movement** to refresh.")
     else:
         st.info("No snapshot yet. Click **Check for movement** to capture current odds.")
 
 st.markdown("---")
-st.caption("Opening odds appear when the API returns them. Movement is calculated from the previous snapshot of current odds.")
+st.caption("HTML fallback is basic and may pick up non-odds numbers. GraphQL is preferred when it works. Movement is based on previous current odds.")
