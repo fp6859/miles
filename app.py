@@ -83,13 +83,18 @@ def fetch_odds(event_id: str, geo_code: str = "GB") -> tuple[list[dict], str]:
             timeout=12
         )
         if resp.status_code != 200:
-            return [], f"HTTP {resp.status_code}"
+            # Capture the actual error message from the server
+            body_preview = resp.text[:300].replace("\n", " ")
+            return [], f"HTTP {resp.status_code}: {body_preview}"
+        
         data = resp.json()
         event_odds = data.get("data", {}).get("findOddsByEventId") or {}
         if not event_odds:
             return [], "Empty findOddsByEventId"
     except Exception as e:
         return [], str(e)
+
+    # ... rest of the function stays the same (bookmaker mapping + outcomes parsing) ...
 
     bk_map = {}
     for bk in event_odds.get("settings", {}).get("bookmakers", []):
