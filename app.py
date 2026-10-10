@@ -1,13 +1,16 @@
 import streamlit as st
 import requests
 import time
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 import pandas as pd
 
-st.set_page_config(page_title="Flashscore Odds Shortening Finder", page_icon="📉", layout="wide")
-st.title("📉 Flashscore Odds Shortening Finder")
-st.caption("Find games where main-market odds have shortened (opening → current).")
+st.set_page_config(page_title="Odds Movement Tracker", page_icon="📉", layout="wide")
+st.title("📉 Odds Movement Tracker")
+st.caption("Tracks shortening since the last check (not from opening). First run just saves current odds.")
 
+# ── Sport mapping ────────────────────────────────────────────
 SPORTS = {
     "Football (Soccer)": 1,
     "Tennis": 2,
@@ -22,6 +25,7 @@ SPORTS = {
 
 SEP_FIELD = chr(0xAC)
 SEP_KV = chr(0xF7)
+CACHE_FILE = Path("odds_cache.json")
 
 FS_HEADERS = {
     "x-fsign": "SW9D1eZo",
@@ -29,6 +33,7 @@ FS_HEADERS = {
     "Referer": "https://www.flashscore.com/",
     "Accept": "*/*",
     "Origin": "https://www.flashscore.com",
+    "Accept-Language": "en-GB,en;q=0.9",
 }
 
 def parse_fields(section: str) -> dict:
@@ -67,109 +72,111 @@ def fetch_matches(sport_id: int, day_offset: int = 0) -> list[dict]:
         })
     return matches
 
-def fetch_odds(event_id: str, geo_code: str = "GB") -> tuple[list[dict], str]:
-    headers = FS_HEADERS.copy()
-    headers.update({
-        "Accept-Language": "en-GB,en;q=0.9",
-        "x-geoip": "1",
-    })
+def fetch_current_odds(event_id: str, geo_code: str = "GB") -> dict:
+    """Returns a simple dict of best/current main-market odds or empty."""
+    params = {
+        "_hash": "oce",
+        "eventId": event_id,
+        "projectId": "2",
+        "geoIpCode": geo_code,
+    }
+    try:
+        resp = requests.get(
+            "https://global.ds.lsapp.eu/odds/pq_graphql",
+            params=params,
+            headers=FS_HEADERS,
+            timeout=12
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        event_odds = data.get("data", {}).get("findOddsByEventId") or {}
+        if not event_odds:
+            return {}
+    except Exception:
+        return {}
 
-    # Try a few known / common hashes
-    hashes_to_try = ["oce", "oce2", "odds", "fsodds", "pqo"]
-
-    for h in hashes_to_try:
-        params = {
-            "_hash": h,
-            "eventId": event_id,
-            "projectId": "2",
-            "geoIpCode": geo_code,
-        }
-        try:
-            resp = requests.get(
-                "https://global.ds.lsapp.eu/odds/pq_graphql",
-                params=params,
-                headers=headers,
-                timeout=12
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                event_odds = data.get("data", {}).get("findOddsByEventId") or {}
-                if event_odds:
-                    # success — continue with normal parsing below
-                    break
-            # else keep trying next hash
-        except Exception:
-            continue
-    else:
-        # All hashes failed
-        return [], "All hash attempts failed (HTTP 400 or empty)"
-
-    # ── normal parsing continues here (copy from previous version) ──
-    bk_map = {}
-    for bk in event_odds.get("settings", {}).get("bookmakers", []):
-        inner = bk.get("bookmaker", {})
-        bid = str(inner.get("id", ""))
-        if bid:
-            bk_map[bid] = inner.get("name", bid)
-
-    results = []
+    # Take the first usable bookmaker’s main market
     for item in event_odds.get("odds", []):
         if item.get("bettingScope") != "FULL_TIME":
             continue
         if item.get("bettingType") not in ("HOME_DRAW_AWAY", "HOME_AWAY"):
             continue
         odds_items = item.get("odds", [])
-        outcomes = []
-        for o in odds_items:
+        if not odds_items:
+            continue
+        try:
+            return {
+                "home": float(odds_items[0]["value"]),
+                "draw": float(odds_items[1]["value"]) if len(odds_items) > 2 else None,
+                "away": float(odds_items[-1]["value"]),
+                "bookmaker": item.get("bookmakerId", "unknown"),
+            }
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+    return {}
+
+def load_cache() -> dict:
+    if "odds_cache" not in st.session_state:
+        st.session_state.odds_cache = {}
+        if CACHE_FILE.exists():
             try:
-                curr = float(o["value"])
-                open_raw = o.get("opening")
-                open_ = float(open_raw) if open_raw is not None else curr
-                outcomes.append({"current": curr, "opening": open_})
-            except (TypeError, ValueError, KeyError):
-                continue
-        if outcomes:
-            results.append({
-                "bookmaker_name": bk_map.get(str(item.get("bookmakerId", "")), "Unknown"),
-                "bettingType": item.get("bettingType"),
-                "outcomes": outcomes,
-            })
-    return results, ""
-def percentage_shortening(opening: float, current: float) -> float:
-    if not opening or opening <= 0 or current >= opening:
+                st.session_state.odds_cache = json.loads(CACHE_FILE.read_text())
+            except Exception:
+                pass
+    return st.session_state.odds_cache
+
+def save_cache(cache: dict):
+    st.session_state.odds_cache = cache
+    try:
+        CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    except Exception:
+        pass  # Cloud may not allow writing; session state still works
+
+def percentage_drop(old: float, new: float) -> float:
+    if not old or old <= 0 or new >= old:
         return 0.0
-    return round((opening - current) / opening * 100.0, 1)
+    return round((old - new) / old * 100.0, 1)
 
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Settings")
     sport_name = st.selectbox("Sport", list(SPORTS.keys()))
-    threshold = st.slider("Minimum shortening (%)", 1.0, 30.0, 5.0, 0.5)
+    threshold = st.slider("Minimum shortening since last check (%)", 1.0, 25.0, 5.0, 0.5)
     day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
     day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
     geo_code = st.selectbox("Bookmaker region", ["GB", "US", "DE", "FR", "ES", "IT"])
-    max_matches = st.number_input("Max matches to scan", 10, 100, 30, 5)
-    delay = st.slider("Delay (seconds)", 0.3, 2.0, 0.6, 0.1)
-    run_button = st.button("🔍 Search", type="primary", use_container_width=True)
+    max_matches = st.number_input("Max matches to scan", 10, 80, 30, 5)
+    delay = st.slider("Delay between requests (s)", 0.4, 2.0, 0.7, 0.1)
+    clear_cache = st.button("Clear stored odds", use_container_width=True)
+    run_button = st.button("🔄 Check for movement", type="primary", use_container_width=True)
+
+if clear_cache:
+    st.session_state.odds_cache = {}
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink(missing_ok=True)
+    st.success("Stored odds cleared.")
 
 # ── Main ─────────────────────────────────────────────────────
+cache = load_cache()
+
 if run_button:
     sport_id = SPORTS[sport_name]
     with st.spinner("Fetching matches..."):
         matches = fetch_matches(sport_id, day_offset)
 
     if not matches:
-        st.warning("No matches returned from the feed.")
+        st.warning("No matches found.")
         st.stop()
 
-    st.info(f"Found {len(matches)} matches. Checking odds...")
+    st.info(f"Found {len(matches)} matches. Checking current odds...")
 
     progress = st.progress(0)
     status = st.empty()
-    candidates = []
-    all_moves = []
-    odds_errors = {}
-    matches_with_odds = 0
+    movements = []
+    new_cache = {}
+    scanned = 0
+    had_odds = 0
 
     to_scan = matches[:max_matches]
 
@@ -177,71 +184,75 @@ if run_button:
         status.text(f"{i+1}/{len(to_scan)}: {m['home']} vs {m['away']}")
         progress.progress((i + 1) / len(to_scan))
 
-        odds_list, err = fetch_odds(m["event_id"], geo_code)
-        if err:
-            odds_errors[err] = odds_errors.get(err, 0) + 1
+        current = fetch_current_odds(m["event_id"], geo_code)
+        if not current:
             continue
 
-        if not odds_list:
-            odds_errors["No usable odds"] = odds_errors.get("No usable odds", 0) + 1
-            continue
+        had_odds += 1
+        key = m["event_id"]
+        new_cache[key] = {
+            "home": current["home"],
+            "draw": current.get("draw"),
+            "away": current["away"],
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "match": f"{m['home']} vs {m['away']}",
+        }
 
-        matches_with_odds += 1
-        best_pct = 0.0
-        best_detail = None
+        previous = cache.get(key)
+        if previous:
+            drops = []
+            for side in ["home", "draw", "away"]:
+                old = previous.get(side)
+                new = current.get(side)
+                if old and new:
+                    pct = percentage_drop(old, new)
+                    if pct >= threshold:
+                        drops.append(f"{side.title()} {old} → {new} ({pct}%)")
 
-        for bk in odds_list:
-            for oc in bk["outcomes"]:
-                pct = percentage_shortening(oc["opening"], oc["current"])
-                if pct > 0:
-                    all_moves.append({
-                        "Match": f"{m['home']} vs {m['away']}",
-                        "Bookmaker": bk["bookmaker_name"],
-                        "Opening": oc["opening"],
-                        "Current": oc["current"],
-                        "Shortening %": pct,
-                    })
-                if pct > best_pct:
-                    best_pct = pct
-                    best_detail = (bk["bookmaker_name"], oc["opening"], oc["current"], pct)
+            if drops:
+                start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
+                movements.append({
+                    "Home": m["home"],
+                    "Away": m["away"],
+                    "Tournament": m["tourney"],
+                    "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
+                    "Movements": " | ".join(drops),
+                    "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
+                })
 
-        if best_pct >= threshold:
-            start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
-            candidates.append({
-                "Home": m["home"],
-                "Away": m["away"],
-                "Tournament": m["tourney"],
-                "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
-                "Max Shortening %": best_pct,
-                "Best Move": f"{best_detail[0]} {best_detail[1]} → {best_detail[2]}" if best_detail else "",
-                "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
-            })
-
+        scanned += 1
         time.sleep(delay)
 
     progress.empty()
     status.empty()
 
-    # Error summary
-    if odds_errors:
-        st.warning("Odds request errors:")
-        for err, count in sorted(odds_errors.items(), key=lambda x: -x[1]):
-            st.write(f"- **{err}**: {count} matches")
+    # Save the new snapshot
+    # Keep previous entries for matches we didn’t re-scan this time
+    cache.update(new_cache)
+    save_cache(cache)
 
-    st.info(f"Scanned {len(to_scan)} matches → {matches_with_odds} had usable odds data")
+    st.info(f"Scanned {scanned} matches with odds data.")
 
-    if all_moves:
-        st.subheader("Biggest moves found")
-        st.dataframe(pd.DataFrame(all_moves).sort_values("Shortening %", ascending=False).head(20), hide_index=True)
-
-    candidates.sort(key=lambda x: -x["Max Shortening %"])
-    st.success(f"{len(candidates)} games ≥ {threshold}%")
-
-    if candidates:
-        df = pd.DataFrame(candidates)
-        st.dataframe(df, column_config={"Link": st.column_config.LinkColumn()}, hide_index=True, use_container_width=True)
+    if movements:
+        st.success(f"**{len(movements)}** games shortened ≥ {threshold}% since last check")
+        df = pd.DataFrame(movements)
+        st.dataframe(
+            df,
+            column_config={"Link": st.column_config.LinkColumn()},
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        if any(cache):
+            st.info("No significant shortening since the last check. Run again later.")
+        else:
+            st.success("First run complete — current odds have been saved. Run again later to detect movement.")
 
 else:
-    st.info("Set filters on the left and click Search.")
+    if cache:
+        st.info(f"Stored odds for **{len(cache)}** matches. Click **Check for movement** to compare against current prices.")
+    else:
+        st.info("No stored odds yet. Click **Check for movement** to take the first snapshot.")
 
-st.caption("⚠️ Unofficial Flashscore endpoints — they can break or get blocked at any time.")
+st.markdown("---")
+st.caption("First run saves current odds. Later runs compare against that snapshot and show shortenings. Cache lives in the browser session (and a local file when possible).")
