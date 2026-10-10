@@ -1,138 +1,205 @@
 import streamlit as st
 import requests
 import pandas as pd
+from datetime import datetime, timezone
+import time
 
-st.set_page_config(page_title="bet365 vs Market", page_icon="📊", layout="wide")
-st.title("📊 bet365 vs Wider Market")
-st.caption("Finds where bet365 odds are higher than the best price elsewhere")
+st.set_page_config(page_title="Flashscore Scanner", page_icon="⚽", layout="wide")
+st.title("⚽ Flashscore Multi-Sport Scanner")
+st.caption("Match list + attempted opening/current odds. Odds endpoint can be flaky.")
 
-# ── API key ──────────────────────────────────────────────────
-API_KEY = st.secrets.get("ODDS_API_KEY", "")
-if not API_KEY:
-    API_KEY = st.sidebar.text_input("Odds API Key", type="password",
-                                    help="Free key from the-odds-api.com")
-
+# Sport ID mapping used by Flashscore feeds
 SPORTS = {
-    "Football (EPL)": "soccer_epl",
-    "Football (La Liga)": "soccer_spain_la_liga",
-    "Football (Bundesliga)": "soccer_germany_bundesliga",
-    "Football (Serie A)": "soccer_italy_serie_a",
-    "Football (Ligue 1)": "soccer_france_ligue_one",
-    "American Football (NFL)": "americanfootball_nfl",
-    "Basketball (NBA)": "basketball_nba",
-    "Ice Hockey (NHL)": "icehockey_nhl",
-    "Baseball (MLB)": "baseball_mlb",
+    "Football": 1,
+    "Tennis": 2,
+    "Basketball": 3,
+    "Ice Hockey": 4,
+    "American Football": 5,
+    "Baseball": 6,
+    "Rugby Union": 8,
+    "Rugby League": 19,
+    "Cricket": 13,
+    "Darts": 14,
+    "Horse Racing": 31,
 }
 
-def fetch_odds(sport_key: str, regions: str = "uk"):
-    if not API_KEY:
+SEP_FIELD = chr(0xAC)
+SEP_KV = chr(0xF7)
+
+FS_HEADERS = {
+    "x-fsign": "SW9D1eZo",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": "https://www.flashscore.com/",
+    "Accept": "*/*",
+    "Origin": "https://www.flashscore.com",
+}
+
+def parse_fields(section: str) -> dict:
+    out = {}
+    for part in section.split(SEP_FIELD):
+        if SEP_KV in part:
+            k, _, v = part.partition(SEP_KV)
+            out[k] = v
+    return out
+
+def fetch_matches(sport_id: int, day_offset: int = 0) -> list[dict]:
+    url = f"https://www.flashscore.com/x/feed/f_{sport_id}_{day_offset}_0_en-gb_1"
+    try:
+        resp = requests.get(url, headers=FS_HEADERS, timeout=15)
+        resp.raise_for_status()
+        raw = resp.text
+    except Exception as e:
+        st.error(f"Feed error: {e}")
         return []
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+
+    matches = []
+    cur_tourney = ""
+    for section in raw.split("~"):
+        fields = parse_fields(section)
+        if "ZA" in fields:
+            cur_tourney = fields["ZA"]
+            continue
+        if "AA" not in fields or fields.get("AB") == "3":
+            continue
+        matches.append({
+            "event_id": fields["AA"],
+            "home": fields.get("AE", ""),
+            "away": fields.get("AF", ""),
+            "tournament": cur_tourney,
+            "ts_start": int(fields.get("AD", 0) or 0),
+        })
+    return matches
+
+def fetch_odds(event_id: str) -> dict:
+    """Attempts GraphQL odds. Returns empty dict on failure."""
     params = {
-        "apiKey": API_KEY,
-        "regions": regions,
-        "markets": "h2h",
-        "oddsFormat": "decimal",
+        "_hash": "oce",
+        "eventId": event_id,
+        "projectId": "2",
+        "geoIpCode": "GB",
     }
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        remaining = r.headers.get("x-requests-remaining", "?")
-        st.sidebar.caption(f"Requests remaining: {remaining}")
-        return r.json()
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return []
+        resp = requests.get(
+            "https://global.ds.lsapp.eu/odds/pq_graphql",
+            params=params,
+            headers=FS_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        event_odds = data.get("data", {}).get("findOddsByEventId") or {}
+        if not event_odds:
+            return {}
+        for item in event_odds.get("odds", []):
+            if item.get("bettingScope") != "FULL_TIME":
+                continue
+            if item.get("bettingType") not in ("HOME_DRAW_AWAY", "HOME_AWAY"):
+                continue
+            odds_items = item.get("odds", [])
+            if not odds_items:
+                continue
+            try:
+                result = {
+                    "home_current": float(odds_items[0]["value"]),
+                    "home_opening": float(odds_items[0].get("opening") or odds_items[0]["value"]),
+                    "away_current": float(odds_items[-1]["value"]),
+                    "away_opening": float(odds_items[-1].get("opening") or odds_items[-1]["value"]),
+                }
+                if len(odds_items) > 2:
+                    result["draw_current"] = float(odds_items[1]["value"])
+                    result["draw_opening"] = float(odds_items[1].get("opening") or odds_items[1]["value"])
+                return result
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+    except Exception:
+        pass
+    return {}
 
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Settings")
-    if not API_KEY:
-        st.warning("Enter your free Odds API key")
-    sport_name = st.selectbox("Sport / League", list(SPORTS.keys()))
-    regions = st.selectbox("Region", ["uk", "eu", "us", "au"], index=0)
-    min_edge = st.slider("Minimum bet365 edge (%)", 0.0, 25.0, 3.0, 0.5)
-    run = st.button("🔍 Scan bet365 vs market", type="primary", use_container_width=True)
+    st.header("Filters")
+    selected_sports = st.multiselect(
+        "Sports",
+        list(SPORTS.keys()),
+        default=["Football", "Tennis"],
+    )
+    day_label = st.radio("Day", ["Today", "Tomorrow", "Yesterday"], horizontal=True)
+    day_offset = {"Today": 0, "Tomorrow": 1, "Yesterday": -1}[day_label]
+    league_filter = st.text_input("League / Tournament contains (optional)", "")
+    max_matches = st.number_input("Max matches to check for odds", 10, 100, 30, 5)
+    try_odds = st.checkbox("Try to fetch opening + current odds", value=True)
+    delay = st.slider("Delay between odds requests (s)", 0.3, 2.0, 0.6, 0.1)
+    run = st.button("🔍 Scan matches", type="primary", use_container_width=True)
 
 # ── Main ─────────────────────────────────────────────────────
-if run and API_KEY:
-    sport_key = SPORTS[sport_name]
-    with st.spinner("Fetching odds..."):
-        events = fetch_odds(sport_key, regions)
+if run and selected_sports:
+    all_matches = []
+    for sport_name in selected_sports:
+        sport_id = SPORTS[sport_name]
+        with st.spinner(f"Loading {sport_name}..."):
+            matches = fetch_matches(sport_id, day_offset)
+            for m in matches:
+                m["sport"] = sport_name
+            all_matches.extend(matches)
 
-    if not events:
-        st.warning("No events returned.")
+    if league_filter:
+        all_matches = [m for m in all_matches if league_filter.lower() in m["tournament"].lower()]
+
+    if not all_matches:
+        st.warning("No matches found for the selected filters.")
         st.stop()
 
+    st.info(f"Found {len(all_matches)} matches.")
+
+    # Limit odds checks
+    to_check = all_matches[:max_matches]
     rows = []
-    for ev in events:
-        home = ev.get("home_team", "")
-        away = ev.get("away_team", "")
-        commence = ev.get("commence_time", "")[:16].replace("T", " ")
+    progress = st.progress(0)
+    status = st.empty()
 
-        bookmakers = ev.get("bookmakers", [])
-        if len(bookmakers) < 2:
-            continue
+    for i, m in enumerate(to_check):
+        status.text(f"Checking {i+1}/{len(to_check)}: {m['home']} vs {m['away']}")
+        progress.progress((i + 1) / len(to_check))
 
-        # Separate bet365 from the rest
-        bet365 = None
-        others = []
-        for bm in bookmakers:
-            title = bm.get("title", "").lower()
-            if "bet365" in title or "bet 365" in title:
-                bet365 = bm
-            else:
-                others.append(bm)
+        odds = fetch_odds(m["event_id"]) if try_odds else {}
+        start = datetime.fromtimestamp(m["ts_start"], tz=timezone.utc) if m["ts_start"] else None
 
-        if not bet365 or not others:
-            continue
+        row = {
+            "Sport": m["sport"],
+            "Tournament": m["tournament"],
+            "Home": m["home"],
+            "Away": m["away"],
+            "Start (UTC)": start.strftime("%Y-%m-%d %H:%M") if start else "",
+            "Home Current": odds.get("home_current"),
+            "Home Opening": odds.get("home_opening"),
+            "Draw Current": odds.get("draw_current"),
+            "Draw Opening": odds.get("draw_opening"),
+            "Away Current": odds.get("away_current"),
+            "Away Opening": odds.get("away_opening"),
+            "Link": f"https://www.flashscore.com/match/{m['event_id']}/",
+        }
+        rows.append(row)
+        if try_odds:
+            time.sleep(delay)
 
-        # Get bet365 h2h outcomes
-        b365_market = next((m for m in bet365.get("markets", []) if m["key"] == "h2h"), None)
-        if not b365_market:
-            continue
-        b365_odds = {o["name"]: o["price"] for o in b365_market.get("outcomes", [])}
+    progress.empty()
+    status.empty()
 
-        # Best odds from the rest of the market
-        best_odds = {}
-        for bm in others:
-            market = next((m for m in bm.get("markets", []) if m["key"] == "h2h"), None)
-            if not market:
-                continue
-            for o in market.get("outcomes", []):
-                name = o["name"]
-                price = o["price"]
-                if name not in best_odds or price > best_odds[name]:
-                    best_odds[name] = price
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        column_config={"Link": st.column_config.LinkColumn()},
+        hide_index=True,
+        use_container_width=True,
+        height=500,
+    )
 
-        # Compare each selection
-        for selection in [home, away, "Draw"]:
-            b365_price = b365_odds.get(selection)
-            market_best = best_odds.get(selection)
-            if not b365_price or not market_best or b365_price <= 1 or market_best <= 1:
-                continue
-
-            edge = (b365_price - market_best) / market_best * 100
-            if edge >= min_edge:
-                rows.append({
-                    "Match": f"{home} vs {away}",
-                    "Start": commence,
-                    "Selection": selection,
-                    "bet365 Odds": round(b365_price, 2),
-                    "Best Elsewhere": round(market_best, 2),
-                    "Edge %": round(edge, 1),
-                    "Bookmakers compared": len(others),
-                })
-
-    if rows:
-        df = pd.DataFrame(rows).sort_values("Edge %", ascending=False)
-        st.success(f"Found {len(df)} selections where bet365 is ≥ {min_edge}% better")
-        st.dataframe(df, hide_index=True, use_container_width=True, height=500)
-    else:
-        st.info("No selections found where bet365 beats the wider market by the chosen margin.")
+    odds_found = df["Home Current"].notna().sum()
+    st.caption(f"Odds data returned for {odds_found} of {len(df)} checked matches.")
 
 else:
-    st.info("Enter your API key and click **Scan bet365 vs market**.")
+    st.info("Select sports and click **Scan matches**.")
 
 st.markdown("---")
-st.caption("Compares bet365 h2h odds against the best available price from other bookmakers in the same region. Higher Edge % = bet365 is offering more value than the rest of the market.")
+st.caption("Match list comes from the Flashscore feed (reliable). Odds are attempted via the GraphQL endpoint and may be empty if it is blocked or rate-limited.")
